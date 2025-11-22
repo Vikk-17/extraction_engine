@@ -1,27 +1,27 @@
 fastapi[standard]
 uvicorn[standard]
-#
+
 # # Database (MongoDB)
 motor
 # beanie
-#
+
 # # Object Storage (MinIO / S3)
 minio
 #
 # # Async Redis
 # aioredis
-#
+
 # # File handling
 aiofiles
 ruff
-#
+
 # # OCR & PDF Extraction
 # pytesseract
 # pillow
 # pdfminer.six
 # pdf2image
 # PyMuPDF
-#
+
 # # Utils
 python-dotenv
 # pydantic
@@ -30,13 +30,9 @@ python-dotenv
 # python-dateutil
 # babel
 # rapidfuzz
-#
+
 # # Testing + formatting
 # pytest
 # pytest-asyncio
 # httpx
-# black
-# isort
-# flake8
-# mypy
-#
+black
