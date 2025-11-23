@@ -42,3 +42,8 @@ http://127.0.0.1:8000/docs/ # swagger api docs
 ```
 
 ![Architecture](./assests/images/architecture.png)
+
+
+## References
+- [Run in Threadpool](https://stackoverflow.com/questions/77935269/performance-results-differ-between-run-in-threadpool-and-run-in-executor-in)
+- [Working with Thread](https://anyio.readthedocs.io/en/stable/threads.html#working-with-threads)

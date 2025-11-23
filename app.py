@@ -1,4 +1,14 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Form
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    UploadFile,
+    HTTPException,
+    Request,
+    Form,
+)
+import hashlib
+from starlette.concurrency import run_in_threadpool
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from minio import Minio
@@ -33,7 +43,7 @@ async def lifespan(app: FastAPI):
 
     # Testing MinIO and MongoDB connection
     try:
-        minio_client.list_buckets()
+        await run_in_threadpool(minio_client.list_buckets)
         print("MinIO connection successful")
 
     except Exception as e:
@@ -50,14 +60,20 @@ async def lifespan(app: FastAPI):
 
     db = motor_client[DB_NAME]
     meta_coll = db[COLLECTION]
+    jobs_coll = db["upload_jobs"]
 
     await meta_coll.create_index("object_name", unique=True)
     await meta_coll.create_index("uploader")
     await meta_coll.create_index("uploaded_at")
 
+    await jobs_coll.create_index("job_id", unique=True)
+    await jobs_coll.create_index("status")
+    await jobs_coll.create_index("created_at")
+
     app.state.minio_client = minio_client
     app.state.motor_client = motor_client
     app.state.meta_coll = meta_coll
+    app.state.jobs_coll = jobs_coll
 
     try:
         yield
@@ -69,54 +85,89 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-# Checksum Generator
-def sha256_bytesio(b: bytes) -> str:
-    import hashlib
-
-    h = hashlib.sha256()
-    h.update(b)
-    return h.hexdigest()
-
-
 @app.post("/upload/")
 async def upload(
-    request: Request, file: UploadFile = File(...), uploader: str | None = Form(None)
+    request: Request,
+    background: BackgroundTasks,
+    file: UploadFile = File(...),
+    uploader: str | None = Form(None),
 ):
     """
-    Upload a file, store to MinIO, insert a submissions doc and enqueue job.
+    Return the job id to the user and consume it for queue
     """
+    job_id = uuid4().hex  # Generate the unique job_id
+
+    meta_coll = request.app.state.meta_coll
+    jobs_coll = request.app.state.jobs_coll
+    await jobs_coll.insert_one(
+        {
+            "job_id": job_id,
+            "status": "pending",
+            "error": None,
+            "result": None,
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+        }
+    )
+
+    # Schedule an asyncronous job using background task
+    background.add_task(process_upload_job, request, job_id, file, uploader)
+
+    return {
+        "job_id": job_id,
+        "status": "queued",
+    }
+
+
+async def process_upload_job(
+    request: Request,
+    job_id: str,
+    file: UploadFile = File(...),
+    uploader: str | None = Form(None),
+):
+
     minio_client = request.app.state.minio_client
     meta_coll = request.app.state.meta_coll
+    jobs_coll = request.app.state.jobs_coll
 
-    if not minio_client.bucket_exists(BUCKET):
-        minio_client.make_bucket(BUCKET)
+    # set the job status process
+    await jobs_coll.update_one(
+        {"job_id": job_id},
+        {"$set": {"status": "processing", "updated_at": datetime.now(timezone.utc)}},
+    )
 
-    contents = await file.read()
-    if not contents:
-        raise HTTPException(status_code=404, detail="Empty File")
-
-    data = BytesIO(contents)  # <- efficient for i/o bound works
-    # data.seek(0) # <- change the stream position to the given bytes
-
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="Missing filename")
-
-    if not file.content_type:
-        raise HTTPException(status_code=400, detail="Missing content type")
-
-    object_name = f"{uuid4().hex}_{file.filename}"
     try:
-        minio_client.put_object(
+        exists = await run_in_threadpool(minio_client.bucket_exists, BUCKET)
+        if not exists:
+            await run_in_threadpool(minio_client.make_bucket, BUCKET)
+
+        contents = await file.read()
+        checksum = hashlib.sha256(contents).hexdigest()
+        stream = BytesIO(contents)  # <- efficient for i/o bound works
+        # stream.seek(0) # <- change the stream position to the given bytes
+
+        if not contents:
+            raise HTTPException(status_code=404, detail="Empty File")
+
+        if not file.filename:
+            raise HTTPException(status_code=404, detail="Missing filename")
+
+        if not file.content_type:
+            raise HTTPException(status_code=404, detail="Missing content type")
+
+        object_name = f"{uuid4().hex}_{file.filename}"
+
+        await run_in_threadpool(
+            minio_client.put_object,
             BUCKET,
             object_name,
-            data,
-            length=len(contents),
+            stream,
+            len(contents),
             content_type=file.content_type,
         )
 
         url = minio_client.presigned_get_object(BUCKET, object_name)
-
-        doc = {
+        meta_doc = {
             "filename": file.filename,
             "object_name": object_name,
             "bucket": BUCKET,
@@ -124,21 +175,47 @@ async def upload(
             "size": len(contents),
             "url": url,
             "uploader": uploader,
-            "checksum_sha256": sha256_bytesio(contents),
+            "checksum_sha256": checksum,
             "uploaded_at": datetime.now(timezone.utc),
         }
 
-        res = await meta_coll.insert_one(doc)
-        doc["_id"] = str(res.inserted_id)
+        res = await meta_coll.insert_one(meta_doc)
+        meta_doc["_id"] = str(res.inserted_id)
 
-        return {
-            "status": "upload successful",
-            "meta": doc,
-        }
+        await jobs_coll.update_one(
+            {"job_id": job_id},
+            {
+                "$set": {
+                    "status": "success",
+                    "result": meta_doc,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
 
     except S3Error as err:
         raise HTTPException(status_code=500, detail=f"MinIO Error: {err}")
 
     except Exception as e:
+        await jobs_coll.update_one(
+            {"job_id": job_id},
+            {
+                "$set": {
+                    "status": "failed",
+                    "error": str(e),
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
+        )
         print(f"Unexpected error: {e}")
         raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
+
+
+@app.get("/job/{job_id}")
+async def get_job_status(job_id: str, request: Request):
+    doc = await request.app.state.jobs_coll.find_one({"job_id": job_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    doc["_id"] = str(doc["_id"])
+    return doc
